@@ -1,89 +1,109 @@
 # 6.2 線形判別分析で MNIST を分類せよ
-
-# 以下の仮定を置く:
-# - カテゴリ c のパターンは N(μ_c, Σ) にしたがう (Σ が全クラスで共通)
 using MLDatasets
 using Statistics
 using LinearAlgebra
-using ProgressMeter
+using PrettyTables
+using OffsetArrays
 using Plots
 
 X, y = MNIST(split=:train)[:]
-X = reshape(X, 28*28, :)
-X_test, y_test = MNIST(split=:test)[:]
-X_test = reshape(X_test, 28*28, :)
+X = reshape(X, 28 * 28, :)
 
+X_test, y_test = MNIST(split=:test)[:]
+X_test = reshape(X_test, 28 * 28, :)
 
 C = 0:9
+d = 28 * 28
 
 N = size(X, 2)
 N_test = size(X_test, 2)
 
-@assert size(X) == (28*28, N)
+@assert size(X) == (d, N)
 @assert size(y) == (N,)
 
-@assert size(X_test) == (28*28, N_test)
+@assert size(X_test) == (28 * 28, N_test)
 @assert size(y_test) == (N_test,)
 
 
-# カテゴリごとの訓練標本
-X_grouped = Dict(c => X[:, y .== c] for c in C)
-N_c = Dict(c => size(X_grouped[c], 2) for c in C)
+# 以下の仮定を置く:
+# - カテゴリ c のパターンは N(μ_c, Σ) にしたがう (Σ が全クラスで共通)
 
-@assert sum(N_c[c] for c in C) == N
 
-# カテゴリごとの標本平均 (最尤推定量)
-μ = Dict(c => mean(X_grouped[c], dims=2) for c in C)
+# カテゴリごとの訓練標本, 標本数, 標本平均 (= μ_c の最尤推定量) 
+X_c = OffsetArray{Matrix{Float64}}(undef, 0:9)
+N_c = OffsetArray{Int}(undef, 0:9)
+μ̂_c = OffsetArray{Vector{Float64}}(undef, 0:9)
 
-@assert size(μ[0]) == (28*28, 1)
+for c in C
+    X_c[c] = X[:, y.==c]
+    N_c[c] = size(X_c[c], 2)
+    μ̂_c[c] = mean(X_c[c], dims=2) |> vec
+end
+
+for c in C
+    # 数字の向きが左が上になってるので右に90度回転させる
+    img = μ̂_c[c] |> (x -> reshape(x, 28, 28)) |> transpose |> (x -> reverse(x, dims=1))
+    heatmap(img, aspect_ratio=1, title="c = $c", color=:grays)
+    savefig("figure/ch06/mnist-μ̂_c-$c.png")
+end
+
+@assert sum(N_c) == N
+@assert all(size(μ̂_c[c]) == (d,) for c in C)
 
 # 共通の分散共分散行列を最尤推定する.
 # 共通の分散共分散行列は、各カテゴリの分散共分散行列の標本数による重み付き平均 
-Σ = sum(cov(X_grouped[c], dims=2) * N_c[c] for c in C) / N
+Σ̂ = sum(cov(X_c[c], dims=2) * N_c[c] for c in C) / N
 
-# 逆行列が存在しない場合、正定値性を保証するための小さな値を加える
-if !(isposdef(Σ))
-    Σ = Σ + 0.01 * I
+@assert size(Σ̂) == (d, d)
+
+# 正定値性を確認し、正定値でない場合は微小値を足して正定値にする
+if !(isposdef(Σ̂))
+    Σ̂ += 1e-6 * I
 end
 
-Σ⁻¹ = inv(Σ)
+@assert isposdef(Σ̂)
 
-# カテゴリ c の対数事後確率 (定数項は無視)
-function posterior(x, c)::Float64
-    μ_c = μ[c]
-    logp = x' * Σ⁻¹ * μ_c .- 0.5 * μ_c' * Σ⁻¹ * μ_c
-    return logp[1]
+Σ̂⁻¹ = inv(Σ̂)
+μ̂ = hcat(μ̂_c...)
+
+# 事後確率の第二項と第三項を前計算しておく. (カテゴリのみに依り、 x に依らないので)
+# 事後確率の第二項
+p2 = [-0.5 * μ̂_c[c]' * Σ̂⁻¹ * μ̂_c[c] for c in C]
+# 事後確率の第三項
+p3 = log.(OffsetArrays.no_offset_view(N_c))
+p_c = p2 .+ p3
+
+# カテゴリ c の事後確率 (パターンにもカテゴリにも依らない項は省略)
+function posterior_batch(X::Matrix)::Matrix{Float64}
+    p1 = X' * Σ̂⁻¹ * μ̂
+    return p1 .+ p_c'
 end
-    
+
 # 最大事後確率則による分類
-function predict(x)
-    return argmax(posterior(x, c) for c in C) - 1
+ŷ = argmax(posterior_batch(X), dims=2) .|> (x -> x[2] - 1)
+ŷ_test = argmax(posterior_batch(X_test), dims=2) .|> (x -> x[2] - 1)
+
+# 訓練誤差
+accuracy = sum(ŷ .== y) / N
+println("Train Accuracy: $accuracy")
+
+# テスト誤差
+accuracy_test = sum(ŷ_test .== y_test) / N_test
+println("Test Accuracy: $accuracy_test")
+
+function viz_confusion_matrix(confusion_matrix::Matrix{Int})
+    confusion_matrix = hcat(0:9, confusion_matrix)
+    highliter = Highlighter(
+        (data, i, j) -> (j > 0) && (i + 1 == j),
+        crayon"green"
+    )
+    header = ["true / pred", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+    pretty_table(confusion_matrix, header=header, highlighters=(highliter,))
 end
-
-X_test, y_test = MNIST(split=:test)[:]
-X_test = reshape(X_test, 28*28, :)
-
-N_test = size(X_test, 2)
-y_pred = similar(y_test)
-
-@showprogress for i in 1:N_test
-    x = X_test[:, i]
-    y_pred[i] = predict(x)
-end
-
-accuracy = sum(y_pred .== y_test) / N_test
-
-println("Accuracy: $accuracy")
 
 # 混同行列
 confusion_matrix = zeros(Int, 10, 10)
-
 for i in 1:N_test
-    confusion_matrix[y_test[i] + 1, y_pred[i] + 1] += 1
+    confusion_matrix[y_test[i]+1, ŷ_test[i]+1] += 1
 end
-
-# 数字も表示
-heatmap(confusion_matrix, c=:blues, xlabel="Predicted", ylabel="True", title="Confusion Matrix", 
-        xticks=(1:10, 0:9), yticks=(1:10, 0:9), aspect_ratio=1, fmt=:d)
-
-savefig("figure/ch06.png")
+viz_confusion_matrix(confusion_matrix)
